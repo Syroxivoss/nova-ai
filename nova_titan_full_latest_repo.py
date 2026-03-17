@@ -1062,7 +1062,9 @@ class LegacyNovaTrainerPipeline:
             "backend": self.train_cfg.distributed_backend,
             "precision": self.train_cfg.precision,
             "effective_batch_size": self.effective_batch_size,
-            "planned_total_tokens": self.total_tokens(),
+            "planned_total_tokens": self.train_cfg.target_tokens or self.total_tokens(),
+            "target_tokens": self.train_cfg.target_tokens,
+            "max_steps": self.train_cfg.max_steps,
             "torch_available": optional_import("torch") is not None,
             "accelerate_available": optional_import("accelerate") is not None,
             "deepspeed_available": optional_import("deepspeed") is not None,
@@ -2159,6 +2161,8 @@ class NovaTitanOrchestrator:
 
         self.model_cfg = ModelArchitectureConfig(max_seq_len=4096)
         self.train_cfg = TrainingConfig()
+        self.train_cfg.target_tokens = int(os.getenv("NOVA_TRAIN_TOKENS", "0") or 0)
+        self.train_cfg.infinite_streaming = os.getenv("NOVA_INFINITE_TRAINING", "1") == "1"
         self.trainer = NovaTrainerPipeline(self.model_cfg, self.train_cfg)
         self.compute = ComputePlan(target_tokens=target_tokens)
 
@@ -2306,12 +2310,23 @@ class NovaTitanOrchestrator:
 
         training_info = self.trainer.init_training()
         training_run = None
-        if os.getenv("NOVA_RUN_TRAINING", "0") == "1" and packed_chunks:
-            training_run = self.trainer.train(
-                packed_chunks,
-                self.base_dir / "training_runs" / safe_filename(version),
-                token_counter=self.token_counter,
-            )
+        if os.getenv("NOVA_RUN_TRAINING", "0") == "1":
+            if use_streaming and self.shard_mgr.shards:
+                if self.train_cfg.infinite_streaming or self.train_cfg.target_tokens:
+                    train_source: Iterable[DocumentChunk] = self.shard_mgr.stream_shards_forever()
+                else:
+                    train_source = self.shard_mgr.stream_shards()
+                training_run = self.trainer.train(
+                    train_source,
+                    self.base_dir / "training_runs" / safe_filename(version),
+                    token_counter=self.token_counter,
+                )
+            elif packed_chunks:
+                training_run = self.trainer.train(
+                    packed_chunks,
+                    self.base_dir / "training_runs" / safe_filename(version),
+                    token_counter=self.token_counter,
+                )
 
         eval_spec = None
         eval_model_path = os.getenv("NOVA_EVAL_MODEL", "")
@@ -2814,6 +2829,10 @@ class DatasetShardManager:
                 with open(shard_path, encoding="utf-8") as handle:
                     for line in handle:
                         yield DocumentChunk(**json.loads(line))
+
+    def stream_shards_forever(self) -> Iterator[DocumentChunk]:
+        while self.shards:
+            yield from self.stream_shards()
 
     def _write_jsonl(self, packed_chunks: Iterator[DocumentChunk], output_dir: Path) -> int:
         shard_idx = 0
@@ -3480,6 +3499,11 @@ class TrainingConfig:
     grad_noise_scale: bool = True
     streaming: bool = True
     shuffle_buffer: int = 1000
+    warmup_sequences: int = 64
+    target_tokens: int = 0
+    log_every_n_steps: int = 50
+    log_gpu_every_n_steps: int = 200
+    infinite_streaming: bool = True
     fsdp_wrap_min_params: int = 1_000_000
     tp_size: int = 1
     pp_size: int = 1
@@ -3798,7 +3822,7 @@ class NovaTrainerPipeline:
             model = self._apply_pipeline_parallel(torch_mod, model, dist)
         return model, optimizer, deepspeed_engine
 
-    def train(self, chunks: Sequence[DocumentChunk], output_dir: Path, token_counter: Optional[TokenCounter] = None) -> Dict[str, Any]:
+    def train(self, chunks: Iterable[DocumentChunk], output_dir: Path, token_counter: Optional[TokenCounter] = None) -> Dict[str, Any]:
         torch_mod = optional_import("torch")
         if not torch_mod:
             raise RuntimeError("Install torch to run the training loop.")
@@ -3807,9 +3831,33 @@ class NovaTrainerPipeline:
         dist.init_process_group(torch_mod)
         device = dist.device(torch_mod)
         vocab_size = self.model_cfg.vocab_size
+        target_tokens = max(0, int(self.train_cfg.target_tokens))
+        max_steps = self.train_cfg.max_steps if self.train_cfg.max_steps > 0 else None
+
+        def _is_reiterable(obj: Any) -> bool:
+            try:
+                iterator = iter(obj)
+            except TypeError:
+                return False
+            return iterator is not obj
+
+        infinite_streaming = bool(self.train_cfg.streaming and self.train_cfg.infinite_streaming)
+        if infinite_streaming and not _is_reiterable(chunks):
+            log.warning("Infinite streaming requested but chunk source is not re-iterable; falling back to finite stream.")
+            infinite_streaming = False
+        if target_tokens > 0 and not self.train_cfg.streaming:
+            log.warning("Target tokens set but streaming is disabled; training will stop when data is exhausted.")
+
         if self.train_cfg.streaming:
-            seq_iter = self._iter_sequences(chunks, token_counter, vocab_size)
-            warmup_count = min(self.train_cfg.max_batch_size, self.train_cfg.max_train_sequences)
+            def _sequence_source() -> Iterator[List[int]]:
+                while True:
+                    for seq in self._iter_sequences(iter(chunks), token_counter, vocab_size):
+                        yield seq
+                    if not infinite_streaming:
+                        break
+
+            seq_iter = _sequence_source()
+            warmup_count = max(self.train_cfg.max_batch_size, self.train_cfg.warmup_sequences)
             warmup = list(islice(seq_iter, warmup_count))
             if not warmup:
                 raise RuntimeError("No training sequences were produced.")
@@ -3838,7 +3886,12 @@ class NovaTrainerPipeline:
                     while buf:
                         yield buf.pop()
 
-            full_iter = islice(chain(warmup, seq_iter), self.train_cfg.max_train_sequences)
+            full_iter: Iterator[List[int]] = chain(warmup, seq_iter)
+            sequence_cap = None
+            if not infinite_streaming and target_tokens == 0 and self.train_cfg.max_train_sequences > 0:
+                sequence_cap = self.train_cfg.max_train_sequences
+            if sequence_cap is not None:
+                full_iter = islice(full_iter, sequence_cap)
             full_iter = _shuffle_buffer(full_iter, self.train_cfg.shuffle_buffer)
 
             class _SequenceDataset(torch_mod.utils.data.IterableDataset):
@@ -3890,6 +3943,10 @@ class NovaTrainerPipeline:
         losses = []
         micro_norms: List[float] = []
         step = 0
+        tokens_seen = 0
+        start_time = time.time()
+        last_log_time = start_time
+        last_log_tokens = 0
         optimizer.zero_grad(set_to_none=True)
         for batch in dataloader:
             seq = batch[0] if isinstance(batch, (list, tuple)) else batch
@@ -3897,6 +3954,7 @@ class NovaTrainerPipeline:
             with mp.autocast():
                 outputs = model(seq[:, :-1], labels=seq[:, 1:])
                 loss = outputs.loss / self.train_cfg.gradient_accumulation_steps
+            loss_value = float(loss.detach().cpu()) * self.train_cfg.gradient_accumulation_steps
             if deepspeed_engine:
                 deepspeed_engine.backward(loss)
                 deepspeed_engine.step()
@@ -3924,11 +3982,37 @@ class NovaTrainerPipeline:
                     if gns is not None:
                         log.info("Gradient noise scale: %.6f", gns)
                 micro_norms = []
-            losses.append(float(loss.detach().cpu()) * self.train_cfg.gradient_accumulation_steps)
+            losses.append(loss_value)
+            batch_tokens = int(seq.shape[0] * max(0, seq.shape[1] - 1))
+            tokens_seen += batch_tokens
             step += 1
+            if self.train_cfg.log_every_n_steps and step % self.train_cfg.log_every_n_steps == 0:
+                now = time.time()
+                interval_tokens = tokens_seen - last_log_tokens
+                interval_time = max(1e-6, now - last_log_time)
+                tok_per_sec = interval_tokens / interval_time
+                ppl = math.exp(min(20.0, loss_value))
+                log.info(
+                    "step=%d loss=%.4f ppl=%.2f tokens=%d tok/s=%.0f",
+                    step,
+                    loss_value,
+                    ppl,
+                    tokens_seen,
+                    tok_per_sec,
+                )
+                last_log_time = now
+                last_log_tokens = tokens_seen
+            if self.train_cfg.log_gpu_every_n_steps and step % self.train_cfg.log_gpu_every_n_steps == 0:
+                if torch_mod.cuda.is_available():
+                    alloc = torch_mod.cuda.memory_allocated() / (1024 ** 2)
+                    reserved = torch_mod.cuda.memory_reserved() / (1024 ** 2)
+                    log.info("gpu_mem_mb alloc=%.0f reserved=%.0f", alloc, reserved)
             if step % self.train_cfg.save_every_n_steps == 0:
                 self._save_checkpoint(model, optimizer, scheduler, checkpoint_dir / f"step_{step:06d}.pt", torch_mod)
-            if step >= self.train_cfg.max_steps:
+            if target_tokens and tokens_seen >= target_tokens:
+                log.info("Target tokens reached: %d", tokens_seen)
+                break
+            if max_steps is not None and step >= max_steps:
                 break
         self._save_checkpoint(model, optimizer, scheduler, checkpoint_dir / "final.pt", torch_mod)
         return {
@@ -4143,7 +4227,9 @@ class TokenizerConfig:
     special_tokens: List[str] = field(default_factory=lambda: [
         "<|pad|>", "<|unk|>", "<|bos|>", "<|eos|>",
         "<|sys|>", "<|tool|>", "<|code|>", "<|math|>",
+        "[SYS]", "[/SYS]", "[USER]", "[/USER]", "[ASSISTANT]", "[/ASSISTANT]",
     ])
+    unicode_normalization: str = "NFKC"
     byte_fallback: bool = True
     prune_vocab_size: int = 0
     benchmark_samples: int = 200
@@ -4183,6 +4269,10 @@ class BPETokenizerTrainer:
         except Exception:
             pass
         tokenizer = tokenizers_mod.Tokenizer(tokenizers_mod.models.BPE(**model_kwargs))
+        normalizer_name = (self.config.unicode_normalization or "").upper()
+        normalizer_cls = getattr(tokenizers_mod.normalizers, normalizer_name, None) if normalizer_name else None
+        if normalizer_cls is not None:
+            tokenizer.normalizer = tokenizers_mod.normalizers.Sequence([normalizer_cls()])
         tokenizer.pre_tokenizer = tokenizers_mod.pre_tokenizers.ByteLevel(add_prefix_space=False)
         tokenizer.decoder = tokenizers_mod.decoders.ByteLevel()
         trainer = tokenizers_mod.trainers.BpeTrainer(
@@ -4855,6 +4945,8 @@ class NovaTitanOrchestratorV3(NovaTitanOrchestrator):
 
         self.model_cfg = ModelArchitectureConfig(max_seq_len=8192)
         self.train_cfg = TrainingConfig()
+        self.train_cfg.target_tokens = int(os.getenv("NOVA_TRAIN_TOKENS", "0") or 0)
+        self.train_cfg.infinite_streaming = os.getenv("NOVA_INFINITE_TRAINING", "1") == "1"
         self.trainer = NovaTrainerPipeline(self.model_cfg, self.train_cfg)
         self.packer = ContextPacker(context_window=self.model_cfg.max_seq_len, overlap=512)
         self.evaluator = Evaluator()
