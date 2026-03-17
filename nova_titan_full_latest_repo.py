@@ -4584,14 +4584,15 @@ class InferenceConfig:
     tensor_parallel_size: int = 1
     dtype: str = "auto"
     max_model_len: int = 4096
+    temperature: float = 0.7
     draft_model_name_or_path: str = ""
     enable_speculative: bool = False
     enable_continuous_batching: bool = False
     quantization: str = ""
     max_batch_size: int = 8
-    top_k: int = 0
-    top_p: float = 1.0
-    repetition_penalty: float = 1.0
+    top_k: int = 50
+    top_p: float = 0.9
+    repetition_penalty: float = 1.1
 
 
 class MemoryManager:
@@ -4711,6 +4712,12 @@ class SpeculativeDecoder:
 
 
 class InferenceEngine:
+    PRESETS = {
+        "balanced": {"top_k": 50, "top_p": 0.9, "repetition_penalty": 1.1, "temperature": 0.7},
+        "creative": {"top_k": 100, "top_p": 0.95, "repetition_penalty": 1.05, "temperature": 0.9},
+        "strict": {"top_k": 20, "top_p": 0.8, "repetition_penalty": 1.2, "temperature": 0.5},
+    }
+
     def __init__(self, config: InferenceConfig):
         self.config = config
         self._loaded = False
@@ -4721,15 +4728,30 @@ class InferenceEngine:
         self,
         prompt: Any,
         max_new_tokens: int = 256,
-        temperature: float = 0.7,
+        temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
+        preset: Optional[str] = None,
     ) -> Any:
         self._ensure_loaded()
         backend = self._backend
         if not backend:
             raise RuntimeError("Inference backend was not initialized.")
+        if preset:
+            preset_cfg = self.PRESETS.get(preset.lower())
+            if preset_cfg:
+                if temperature is None:
+                    temperature = preset_cfg.get("temperature")
+                if top_k is None:
+                    top_k = preset_cfg.get("top_k")
+                if top_p is None:
+                    top_p = preset_cfg.get("top_p")
+                if repetition_penalty is None:
+                    repetition_penalty = preset_cfg.get("repetition_penalty")
+            else:
+                log.warning("Unknown preset '%s'. Available: %s", preset, ", ".join(sorted(self.PRESETS)))
+        temperature = self.config.temperature if temperature is None else temperature
         top_k = self.config.top_k if top_k is None else top_k
         top_p = self.config.top_p if top_p is None else top_p
         repetition_penalty = self.config.repetition_penalty if repetition_penalty is None else repetition_penalty
