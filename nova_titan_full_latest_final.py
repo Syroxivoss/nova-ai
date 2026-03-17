@@ -58,6 +58,14 @@ def optional_import(name: str) -> Any:
         return None
 
 
+def progress(iterable: Iterable[Any], total: Optional[int] = None, desc: str = "") -> Iterable[Any]:
+    tqdm_mod = optional_import("tqdm")
+    tqdm_cls = getattr(tqdm_mod, "tqdm", None) if tqdm_mod else None
+    if tqdm_cls:
+        return tqdm_cls(iterable, total=total, desc=desc)
+    return iterable
+
+
 Tensor: TypeAlias = Any
 DType: TypeAlias = Any
 TorchModule: TypeAlias = Any
@@ -1062,8 +1070,8 @@ class LegacyNovaTrainerPipeline:
             "backend": self.train_cfg.distributed_backend,
             "precision": self.train_cfg.precision,
             "effective_batch_size": self.effective_batch_size,
-            "planned_total_tokens": self.train_cfg.target_tokens or self.total_tokens(),
-            "target_tokens": self.train_cfg.target_tokens,
+            "planned_total_tokens": self.total_tokens(),
+            "target_tokens": None,
             "max_steps": self.train_cfg.max_steps,
             "torch_available": optional_import("torch") is not None,
             "accelerate_available": optional_import("accelerate") is not None,
@@ -1583,6 +1591,30 @@ class LegacyEvaluator:
         return parsed
 
     def print_report(self, results: Dict[str, BenchmarkResult]):
+        rich_mod = optional_import("rich")
+        if rich_mod:
+            try:
+                from rich.console import Console
+                from rich.table import Table
+                table = Table(title="Benchmark Report")
+                table.add_column("Benchmark", justify="left")
+                table.add_column("Score", justify="right")
+                table.add_column("Target", justify="right")
+                table.add_column("Metric", justify="left")
+                table.add_column("Status", justify="left")
+                for result in results.values():
+                    score_text = f"{result.score:.3f}" if result.score is not None else "-"
+                    table.add_row(
+                        result.name,
+                        score_text,
+                        f"{result.target:.2f}",
+                        result.metric,
+                        result.status,
+                    )
+                Console().print(table)
+                return
+            except Exception as exc:
+                log.warning("Rich report failed: %s", exc)
         print("\n" + "=" * 72)
         print(f"{'Benchmark':<16} {'Score':>10} {'Target':>10} {'Metric':<15} Status")
         print("-" * 72)
@@ -2139,6 +2171,7 @@ class NovaTitanOrchestrator:
         self.token_counter = TokenCounter(
             tokenizer_path=self.tokenizer_cfg.tokenizer_json_path,
             pretrained_name_or_path=self.tokenizer_cfg.pretrained_name_or_path,
+            sentencepiece_model_path=self.tokenizer_cfg.sentencepiece_model_path,
         )
         set_default_token_counter(self.token_counter)
 
@@ -2305,8 +2338,16 @@ class NovaTitanOrchestrator:
         tokenizer_trainer = BPETokenizerTrainer(self.tokenizer_cfg)
         tok_result = tokenizer_trainer.train(tokenizer_corpus)
         if tok_result.get("status") == "trained":
-            self.token_counter = TokenCounter(tokenizer_path=tok_result["tokenizer_json"])
-            set_default_token_counter(self.token_counter)
+            if tok_result.get("sentencepiece_model"):
+                self.token_counter = TokenCounter(sentencepiece_model_path=tok_result["sentencepiece_model"])
+                set_default_token_counter(self.token_counter)
+            else:
+                tokenizer_json = tok_result.get("tokenizer_json")
+                if tokenizer_json:
+                    self.token_counter = TokenCounter(tokenizer_path=tokenizer_json)
+                    set_default_token_counter(self.token_counter)
+                else:
+                    log.warning("Tokenizer training completed without model path.")
 
         training_info = self.trainer.init_training()
         training_run = None
@@ -2406,9 +2447,10 @@ class DocumentChunk:
 
 
 class TokenCounter:
-    def __init__(self, tokenizer_path: str = "", pretrained_name_or_path: str = ""):
+    def __init__(self, tokenizer_path: str = "", pretrained_name_or_path: str = "", sentencepiece_model_path: str = ""):
         self.tokenizer_path = tokenizer_path
         self.pretrained_name_or_path = pretrained_name_or_path
+        self.sentencepiece_model_path = sentencepiece_model_path
         self._backend = ""
         self._tokenizer: Any = None
         self._loaded = False
@@ -2425,6 +2467,14 @@ class TokenCounter:
                 return
             except Exception as exc:
                 log.warning("Tokenizer JSON load failed: %s", exc)
+        spm_mod = optional_import("sentencepiece")
+        if spm_mod and self.sentencepiece_model_path and Path(self.sentencepiece_model_path).exists():
+            try:
+                self._tokenizer = spm_mod.SentencePieceProcessor(model_file=self.sentencepiece_model_path)
+                self._backend = "sentencepiece"
+                return
+            except Exception as exc:
+                log.warning("SentencePiece load failed: %s", exc)
         if self.pretrained_name_or_path:
             transformers_mod = optional_import("transformers")
             if transformers_mod:
@@ -2440,6 +2490,9 @@ class TokenCounter:
         if self._backend == "tokenizers":
             assert self._tokenizer is not None
             return self._tokenizer.encode(text).ids
+        if self._backend == "sentencepiece":
+            assert self._tokenizer is not None
+            return list(self._tokenizer.encode(text, out_type=int))
         if self._backend == "transformers":
             assert self._tokenizer is not None
             return self._tokenizer.encode(text, add_special_tokens=False)
@@ -2453,6 +2506,7 @@ class TokenCounter:
 DEFAULT_TOKEN_COUNTER = TokenCounter(
     tokenizer_path=os.getenv("NOVA_TOKENIZER_JSON", ""),
     pretrained_name_or_path=os.getenv("NOVA_TOKENIZER", ""),
+    sentencepiece_model_path=os.getenv("NOVA_SPM_MODEL", ""),
 )
 
 
@@ -2940,6 +2994,8 @@ class _InstructionShardWriter:
         token_count = estimate_tokens(text)
         if self._handle is None or self._current_tokens + token_count > self.shard_size_tokens:
             self._rotate()
+        if self._handle is None:
+            return
         row = {
             "text": text,
             "system": ex.system,
@@ -3695,7 +3751,7 @@ class NovaTrainerPipeline:
             return torch_mod.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda s: max(0.0, 1.0 - s / max(1, self.train_cfg.max_steps)))
         return None
 
-    def _iter_sequences(self, chunks: Sequence[DocumentChunk], token_counter: TokenCounter, vocab_size: int) -> Iterator[List[int]]:
+    def _iter_sequences(self, chunks: Iterable[DocumentChunk], token_counter: TokenCounter, vocab_size: int) -> Iterator[List[int]]:
         max_len = self.model_cfg.max_seq_len + 1
         for chunk in chunks:
             ids = token_counter.encode(chunk.text)
@@ -3948,7 +4004,8 @@ class NovaTrainerPipeline:
         last_log_time = start_time
         last_log_tokens = 0
         optimizer.zero_grad(set_to_none=True)
-        for batch in dataloader:
+        loop_total = max_steps if max_steps is not None else None
+        for batch in progress(dataloader, total=loop_total, desc="train"):
             seq = batch[0] if isinstance(batch, (list, tuple)) else batch
             seq = seq.to(device)
             with mp.autocast():
@@ -4219,10 +4276,11 @@ class AdaptiveMultilingualBalancer:
 
 @dataclass
 class TokenizerConfig:
-    algorithm: str = "bpe"
+    algorithm: str = field(default_factory=lambda: os.getenv("NOVA_TOKENIZER_ALGO", "bpe"))
     vocab_size: int = 65_536
     min_frequency: int = 2
     tokenizer_json_path: str = ""
+    sentencepiece_model_path: str = ""
     pretrained_name_or_path: str = field(default_factory=lambda: os.getenv("NOVA_TOKENIZER", ""))
     special_tokens: List[str] = field(default_factory=lambda: [
         "<|pad|>", "<|unk|>", "<|bos|>", "<|eos|>",
@@ -4260,6 +4318,29 @@ class BPETokenizerTrainer:
         self.config = config
 
     def train(self, corpus_file: Path) -> dict:
+        if self.config.algorithm.lower() == "sentencepiece":
+            spm_mod = optional_import("sentencepiece")
+            if not spm_mod:
+                return {"status": "skipped", "reason": "install sentencepiece"}
+            model_prefix = corpus_file.parent / "tokenizer_spm"
+            user_symbols = ",".join(self.config.special_tokens) if self.config.special_tokens else ""
+            args = [
+                f"--input={corpus_file}",
+                f"--model_prefix={model_prefix}",
+                f"--vocab_size={self.config.vocab_size}",
+                "--model_type=bpe",
+                "--character_coverage=1.0",
+                "--unk_id=0",
+                "--bos_id=1",
+                "--eos_id=2",
+                "--pad_id=3",
+            ]
+            if user_symbols:
+                args.append(f"--user_defined_symbols={user_symbols}")
+            spm_mod.SentencePieceTrainer.train(" ".join(args))
+            model_path = f"{model_prefix}.model"
+            self.config.sentencepiece_model_path = model_path
+            return {"status": "trained", "sentencepiece_model": model_path, "vocab_size": self.config.vocab_size}
         tokenizers_mod = optional_import("tokenizers")
         if not tokenizers_mod:
             return {"status": "skipped", "reason": "install tokenizers"}
@@ -4619,30 +4700,34 @@ class SpeculativeDecoder:
     def _apply_repetition_penalty(logits, input_ids, penalty: float):
         if penalty is None or penalty == 1.0:
             return logits
-        import torch
-        unique_tokens = torch.unique(input_ids)
+        torch_mod = _TORCH or optional_import("torch")
+        if not torch_mod:
+            raise RuntimeError("Install torch to use repetition penalty.")
+        unique_tokens = torch_mod.unique(input_ids)
         for token_id in unique_tokens:
             idx = int(token_id.item())
             token_logits = logits[..., idx]
-            logits[..., idx] = torch.where(token_logits < 0, token_logits * penalty, token_logits / penalty)
+            logits[..., idx] = torch_mod.where(token_logits < 0, token_logits * penalty, token_logits / penalty)
         return logits
 
     @staticmethod
     def _filter_top_k_top_p(logits, top_k: int, top_p: float):
-        import torch
+        torch_mod = _TORCH or optional_import("torch")
+        if not torch_mod:
+            raise RuntimeError("Install torch to use top-k/top-p sampling.")
         if top_k and top_k > 0:
             top_k = min(top_k, logits.size(-1))
-            values, _ = torch.topk(logits, top_k)
+            values, _ = torch_mod.topk(logits, top_k)
             min_values = values[..., -1, None]
-            logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
+            logits = torch_mod.where(logits < min_values, torch_mod.full_like(logits, float("-inf")), logits)
         if top_p and 0 < top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            probs = torch.softmax(sorted_logits, dim=-1)
-            cumulative_probs = torch.cumsum(probs, dim=-1)
+            sorted_logits, sorted_indices = torch_mod.sort(logits, descending=True)
+            probs = torch_mod.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch_mod.cumsum(probs, dim=-1)
             sorted_mask = cumulative_probs > top_p
             sorted_mask[..., 0] = False
             sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
-            logits = torch.zeros_like(logits).scatter(-1, sorted_indices, sorted_logits)
+            logits = torch_mod.zeros_like(logits).scatter(-1, sorted_indices, sorted_logits)
         return logits
 
     def _sample_next_token(
@@ -4654,14 +4739,16 @@ class SpeculativeDecoder:
         top_p: float,
         repetition_penalty: float,
     ):
-        import torch
+        torch_mod = _TORCH or optional_import("torch")
+        if not torch_mod:
+            raise RuntimeError("Install torch to sample tokens.")
         if temperature <= 0:
             return logits.argmax(dim=-1)
         logits = logits / max(temperature, 1e-5)
         logits = self._apply_repetition_penalty(logits, input_ids, repetition_penalty)
         logits = self._filter_top_k_top_p(logits, top_k, top_p)
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(1)
+        probs = torch_mod.softmax(logits, dim=-1)
+        return torch_mod.multinomial(probs, num_samples=1).squeeze(1)
 
     def generate(
         self,
@@ -4852,6 +4939,9 @@ class InferenceEngine:
         if not transformers_mod or not torch_mod:
             raise RuntimeError("Install transformers and torch for HF inference.")
         quant = self.config.quantization.lower()
+        if quant in ("int8", "int4") and not optional_import("bitsandbytes"):
+            log.warning("bitsandbytes not available; falling back to full precision.")
+            quant = ""
         kwargs = {}
         if quant in ("int8", "int4"):
             kwargs["load_in_8bit"] = quant == "int8"
@@ -5064,6 +5154,7 @@ class NovaTitanOrchestratorV3(NovaTitanOrchestrator):
         self.token_counter = TokenCounter(
             tokenizer_path=self.tokenizer_cfg.tokenizer_json_path,
             pretrained_name_or_path=self.tokenizer_cfg.pretrained_name_or_path,
+            sentencepiece_model_path=self.tokenizer_cfg.sentencepiece_model_path,
         )
         set_default_token_counter(self.token_counter)
 
