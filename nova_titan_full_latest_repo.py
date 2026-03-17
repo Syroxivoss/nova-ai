@@ -2199,6 +2199,11 @@ class NovaTitanOrchestrator:
         self.train_cfg.resume_from = os.getenv("NOVA_RESUME_FROM", "")
         self.train_cfg.resume_optimizer = os.getenv("NOVA_RESUME_OPT", "1") == "1"
         self.train_cfg.resume_scheduler = os.getenv("NOVA_RESUME_SCHED", "1") == "1"
+        self.train_cfg.resume_auto = os.getenv("NOVA_RESUME_AUTO", "1") == "1"
+        self.train_cfg.resume_mode = os.getenv("NOVA_RESUME_MODE", "latest")
+        self.train_cfg.save_every_n_seconds = int(os.getenv("NOVA_SAVE_EVERY_SECS", "0") or 0)
+        self.train_cfg.save_every_n_tokens = int(os.getenv("NOVA_SAVE_EVERY_TOKENS", "0") or 0)
+        self.train_cfg.keep_last_n_checkpoints = int(os.getenv("NOVA_KEEP_LAST_CHECKPOINTS", "0") or 0)
         self.trainer = NovaTrainerPipeline(self.model_cfg, self.train_cfg)
         self.compute = ComputePlan(target_tokens=target_tokens)
 
@@ -2504,6 +2509,21 @@ class TokenCounter:
 
     def count(self, text: str) -> int:
         return len(self.encode(text))
+
+    def pad_id(self) -> Optional[int]:
+        self._load()
+        if self._backend == "tokenizers":
+            assert self._tokenizer is not None
+            token_to_id = getattr(self._tokenizer, "token_to_id", None)
+            return token_to_id("<|pad|>") if token_to_id else None
+        if self._backend == "sentencepiece":
+            assert self._tokenizer is not None
+            pad_id = getattr(self._tokenizer, "pad_id", None)
+            return pad_id() if callable(pad_id) else None
+        if self._backend == "transformers":
+            assert self._tokenizer is not None
+            return getattr(self._tokenizer, "pad_token_id", None)
+        return 0
 
 
 DEFAULT_TOKEN_COUNTER = TokenCounter(
@@ -3130,6 +3150,7 @@ class ModelArchitectureConfig:
     tie_embeddings: bool = True
     use_flash_attention: bool = True
     use_kv_cache: bool = True
+    kv_cache_max_len: int = 0
     attention_dropout: float = 0.0
     residual_dropout: float = 0.0
     use_bias: bool = False
@@ -3239,7 +3260,7 @@ if _TORCH:
             return q, k
 
 
-    class _KVCacheManager:
+class _KVCacheManager:
         def __init__(self, num_layers: int):
             self.num_layers = num_layers
             self.cache: List[Optional[Tuple["Tensor", "Tensor"]]] = [None] * num_layers
@@ -3258,11 +3279,19 @@ if _TORCH:
             assert updated is not None
             return updated
 
+        def prune(self, layer_idx: int, max_len: int) -> None:
+            existing = self.cache[layer_idx]
+            if existing is None:
+                return
+            k, v = existing
+            if k.size(2) > max_len:
+                self.cache[layer_idx] = (k[:, :, -max_len:, :], v[:, :, -max_len:, :])
+
         def clear(self) -> None:
             self.cache = [None] * self.num_layers
 
 
-    class _RoPEAttention(_TORCH.nn.Module):
+class _RoPEAttention(_TORCH.nn.Module):
         def __init__(self, config: ModelArchitectureConfig):
             super().__init__()
             self.num_heads = config.num_attention_heads
@@ -3290,6 +3319,7 @@ if _TORCH:
                 flash_attn_mod = optional_import("flash_attn")
                 if flash_attn_mod and hasattr(flash_attn_mod, "flash_attn_func"):
                     self.flash_attn_func = flash_attn_mod.flash_attn_func
+            self.use_sdpa = hasattr(_F, "scaled_dot_product_attention")
 
         def _repeat_kv(self, tensor: "Tensor") -> "Tensor":
             if self.num_kv_heads == self.num_heads:
@@ -3322,12 +3352,12 @@ if _TORCH:
             if self.sliding_window and k.size(2) > self.sliding_window:
                 k = k[:, :, -self.sliding_window:, :]
                 v = v[:, :, -self.sliding_window:, :]
-            k = self._repeat_kv(k)
-            v = self._repeat_kv(v)
+            k_attn = self._repeat_kv(k)
+            v_attn = self._repeat_kv(v)
             if self.flash_attn_func is not None:
                 q_t = q.transpose(1, 2)
-                k_t = k.transpose(1, 2)
-                v_t = v.transpose(1, 2)
+                k_t = k_attn.transpose(1, 2)
+                v_t = v_attn.transpose(1, 2)
                 attn_out = self.flash_attn_func(
                     q_t,
                     k_t,
@@ -3335,15 +3365,20 @@ if _TORCH:
                     dropout_p=self.dropout_p if self.training else 0.0,
                     causal=True,
                 ).transpose(1, 2)
-            else:
+            elif self.use_sdpa:
                 attn_out = _F.scaled_dot_product_attention(
                     q,
-                    k,
-                    v,
+                    k_attn,
+                    v_attn,
                     attn_mask=None,
                     dropout_p=self.dropout_p if self.training else 0.0,
                     is_causal=True,
                 )
+            else:
+                attn_scores = _TORCH.matmul(q, k_attn.transpose(-2, -1)) * self.scale
+                attn_weights = _TORCH.softmax(attn_scores, dim=-1)
+                attn_weights = _TORCH.dropout(attn_weights, p=self.dropout_p, train=self.training)
+                attn_out = _TORCH.matmul(attn_weights, v_attn)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, -1)
             output = self.o_proj(attn_out)
             new_kv = (k, v) if use_cache else None
@@ -3395,6 +3430,7 @@ if _TORCH:
             self.lm_head = _TORCH.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             if config.tie_embeddings:
                 self.lm_head.weight = self.embed_tokens.weight
+            self.kv_cache = _KVCacheManager(config.num_layers) if config.use_kv_cache else None
             self.gradient_checkpointing = False
 
         def set_gradient_checkpointing(self, enable: bool = True):
@@ -3409,11 +3445,21 @@ if _TORCH:
         ) -> CausalLMOutput:
             b, t = input_ids.size()
             device = input_ids.device
-            position_ids = _TORCH.arange(t, device=device).unsqueeze(0).expand(b, -1)
+            past_len = 0
+            if past_key_values is not None and past_key_values:
+                first = past_key_values[0]
+                if first is not None:
+                    past_len = int(first[0].size(2))
+            position_ids = _TORCH.arange(past_len, past_len + t, device=device).unsqueeze(0).expand(b, -1)
             hidden_states = self.embed_tokens(input_ids)
             new_past: Optional[List[Tuple["Tensor", "Tensor"]]] = [] if use_cache else None
             for idx, block in enumerate(self.blocks):
-                past_kv = past_key_values[idx] if past_key_values is not None else None
+                if past_key_values is not None:
+                    past_kv = past_key_values[idx]
+                elif use_cache and self.kv_cache is not None:
+                    past_kv = self.kv_cache.get(idx)
+                else:
+                    past_kv = None
                 if self.gradient_checkpointing and self.training and not use_cache:
                     def _checkpoint_fn(x):
                         return block(x, position_ids, None, False)[0]
@@ -3421,8 +3467,13 @@ if _TORCH:
                     kv = None
                 else:
                     hidden_states, kv = block(hidden_states, position_ids, past_kv, use_cache)
-                if use_cache and new_past is not None and kv is not None:
-                    new_past.append(kv)
+                if use_cache and kv is not None:
+                    if new_past is not None:
+                        new_past.append(kv)
+                    if self.kv_cache is not None:
+                        self.kv_cache.update(idx, kv[0], kv[1])
+                        if self.config.kv_cache_max_len:
+                            self.kv_cache.prune(idx, self.config.kv_cache_max_len)
             hidden_states = self.norm(hidden_states)
             logits = self.lm_head(hidden_states)
             loss = None
@@ -3441,27 +3492,46 @@ if _TORCH:
             max_new_tokens: int = 128,
             temperature: float = 0.7,
             top_k: int = 0,
+            top_p: float = 1.0,
+            repetition_penalty: float = 1.0,
             use_cache: bool = True,
         ) -> "Tensor":
             self.eval()
             past = None
+            input_ids_full = input_ids
             for _ in range(max_new_tokens):
-                outputs = self(input_ids, use_cache=use_cache, past_key_values=past)
+                step_input = input_ids_full if (past is None or not use_cache) else input_ids_full[:, -1:]
+                outputs = self(step_input, use_cache=use_cache, past_key_values=past)
                 logits = outputs.logits[:, -1, :]
                 past = outputs.past_key_values
                 if temperature <= 0:
                     next_token = logits.argmax(dim=-1, keepdim=True)
                 else:
                     logits = logits / max(temperature, 1e-5)
+                    if repetition_penalty and repetition_penalty != 1.0:
+                        for token_id in _TORCH.unique(input_ids_full):
+                            idx = int(token_id.item())
+                            token_logits = logits[..., idx]
+                            logits[..., idx] = _TORCH.where(
+                                token_logits < 0,
+                                token_logits * repetition_penalty,
+                                token_logits / repetition_penalty,
+                            )
                     if top_k > 0:
                         values, indices = _TORCH.topk(logits, k=top_k, dim=-1)
-                        probs = _TORCH.softmax(values, dim=-1)
-                        next_token = indices.gather(-1, _TORCH.multinomial(probs, num_samples=1))
-                    else:
-                        probs = _TORCH.softmax(logits, dim=-1)
-                        next_token = _TORCH.multinomial(probs, num_samples=1)
-                input_ids = _TORCH.cat([input_ids, next_token], dim=-1)
-            return input_ids
+                        logits = _TORCH.full_like(logits, float("-inf")).scatter(-1, indices, values)
+                    if top_p and top_p < 1.0:
+                        sorted_logits, sorted_indices = _TORCH.sort(logits, descending=True)
+                        probs = _TORCH.softmax(sorted_logits, dim=-1)
+                        cumulative = _TORCH.cumsum(probs, dim=-1)
+                        sorted_mask = cumulative > top_p
+                        sorted_mask[..., 0] = False
+                        sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+                        logits = _TORCH.zeros_like(logits).scatter(-1, sorted_indices, sorted_logits)
+                    probs = _TORCH.softmax(logits, dim=-1)
+                    next_token = _TORCH.multinomial(probs, num_samples=1)
+                input_ids_full = _TORCH.cat([input_ids_full, next_token], dim=-1)
+            return input_ids_full
 
         def to_pipeline_sequential(self):
             class EmbedStage(_TORCH.nn.Module):
@@ -3548,6 +3618,9 @@ class TrainingConfig:
     eval_every_n_steps: int = 250
     max_train_sequences: int = 10000
     dataloader_workers: int = 0
+    pin_memory: bool = True
+    prefetch_factor: int = 2
+    persistent_workers: bool = True
     dynamic_batch_size: bool = True
     max_batch_size: int = 8
     min_batch_size: int = 1
@@ -3566,7 +3639,18 @@ class TrainingConfig:
     resume_from: str = ""
     resume_optimizer: bool = True
     resume_scheduler: bool = True
+    resume_scaler: bool = True
     resume_strict: bool = True
+    resume_auto: bool = True
+    resume_mode: str = "latest"
+    save_every_n_seconds: int = 0
+    save_every_n_tokens: int = 0
+    keep_step_checkpoints: bool = True
+    keep_last_n_checkpoints: int = 0
+    best_loss_ema_decay: float = 0.98
+    save_on_exception: bool = True
+    seed: int = 42
+    deterministic: bool = False
     fsdp_wrap_min_params: int = 1_000_000
     tp_size: int = 1
     pp_size: int = 1
@@ -3760,6 +3844,9 @@ class NovaTrainerPipeline:
 
     def _iter_sequences(self, chunks: Iterable[DocumentChunk], token_counter: TokenCounter, vocab_size: int) -> Iterator[List[int]]:
         max_len = self.model_cfg.max_seq_len + 1
+        pad_id = token_counter.pad_id()
+        if pad_id is None:
+            pad_id = 0
         for chunk in chunks:
             ids = token_counter.encode(chunk.text)
             if not ids:
@@ -3774,7 +3861,7 @@ class NovaTrainerPipeline:
                 if len(seq) < 16:
                     continue
                 if len(seq) < max_len:
-                    seq = seq + [0] * (max_len - len(seq))
+                    seq = seq + [pad_id] * (max_len - len(seq))
                 yield seq[:max_len]
 
     def _build_model(self, torch_mod, vocab_size: int):
@@ -3782,6 +3869,12 @@ class NovaTrainerPipeline:
         model = NovaCausalLM(cfg)
         if self.train_cfg.gradient_checkpointing:
             model.set_gradient_checkpointing(True)
+        if torch_mod.cuda.is_available():
+            try:
+                torch_mod.backends.cuda.matmul.allow_tf32 = True
+                torch_mod.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
         return model
 
     def _grad_norm(self, model) -> float:
@@ -3889,6 +3982,31 @@ class NovaTrainerPipeline:
         torch_mod = optional_import("torch")
         if not torch_mod:
             raise RuntimeError("Install torch to run the training loop.")
+        numpy_mod = optional_import("numpy")
+        if self.train_cfg.seed is not None:
+            random.seed(self.train_cfg.seed)
+            if numpy_mod is not None:
+                numpy_mod.random.seed(self.train_cfg.seed)
+            torch_mod.manual_seed(self.train_cfg.seed)
+            if torch_mod.cuda.is_available():
+                torch_mod.cuda.manual_seed_all(self.train_cfg.seed)
+        if self.train_cfg.deterministic:
+            torch_mod.backends.cudnn.deterministic = True
+            torch_mod.backends.cudnn.benchmark = False
+        if hasattr(torch_mod, "set_float32_matmul_precision"):
+            try:
+                torch_mod.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+        pin_memory = bool(self.train_cfg.pin_memory and torch_mod.cuda.is_available())
+        def _seed_worker(worker_id: int) -> None:
+            if self.train_cfg.seed is None:
+                return
+            seed = int(self.train_cfg.seed) + int(worker_id)
+            random.seed(seed)
+            if numpy_mod is not None:
+                numpy_mod.random.seed(seed)
+            torch_mod.manual_seed(seed)
         token_counter = token_counter or DEFAULT_TOKEN_COUNTER
         dist = DistributedManager(self.train_cfg)
         dist.init_process_group(torch_mod)
@@ -3963,12 +4081,17 @@ class NovaTrainerPipeline:
                         yield torch_mod.tensor(seq, dtype=torch_mod.long)
 
             dataset = _SequenceDataset()
+            streaming_workers = 0
+            if self.train_cfg.dataloader_workers > 0:
+                log.warning("Streaming dataloader_workers > 0 may duplicate work; forcing 0.")
             dataloader = torch_mod.utils.data.DataLoader(
                 dataset,
                 batch_size=self.train_cfg.batch_size_per_gpu,
                 shuffle=False,
-                num_workers=0,
+                num_workers=streaming_workers,
                 drop_last=True,
+                pin_memory=pin_memory,
+                worker_init_fn=_seed_worker if self.train_cfg.seed is not None else None,
             )
         else:
             sequences = list(islice(self._iter_sequences(chunks, token_counter, vocab_size), self.train_cfg.max_train_sequences))
@@ -3984,13 +4107,19 @@ class NovaTrainerPipeline:
                 torch_mod.cuda.empty_cache() if device == "cuda" else None
 
             dataset = torch_mod.utils.data.TensorDataset(torch_mod.tensor(sequences, dtype=torch_mod.long))
-            dataloader = torch_mod.utils.data.DataLoader(
-                dataset,
-                batch_size=self.train_cfg.batch_size_per_gpu,
-                shuffle=True,
-                num_workers=self.train_cfg.dataloader_workers,
-                drop_last=True,
-            )
+            dataloader_kwargs = {
+                "batch_size": self.train_cfg.batch_size_per_gpu,
+                "shuffle": True,
+                "num_workers": self.train_cfg.dataloader_workers,
+                "drop_last": True,
+                "pin_memory": pin_memory,
+                "worker_init_fn": _seed_worker if self.train_cfg.seed is not None else None,
+            }
+            if self.train_cfg.dataloader_workers > 0:
+                if self.train_cfg.prefetch_factor and self.train_cfg.prefetch_factor > 0:
+                    dataloader_kwargs["prefetch_factor"] = self.train_cfg.prefetch_factor
+                dataloader_kwargs["persistent_workers"] = bool(self.train_cfg.persistent_workers)
+            dataloader = torch_mod.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
         model = self._build_model(torch_mod, vocab_size).to(device)
         optimizer = self._build_optimizer(torch_mod, model)
@@ -4010,6 +4139,11 @@ class NovaTrainerPipeline:
         start_time = time.time()
         last_log_time = start_time
         last_log_tokens = 0
+        last_save_time = start_time
+        last_save_tokens = 0
+        best_loss = float("inf")
+        ema_loss: Optional[float] = None
+        ema_decay = float(self.train_cfg.best_loss_ema_decay or 0.0)
         if self.train_cfg.resume_from:
             resume_path = Path(self.train_cfg.resume_from)
             if deepspeed_engine:
@@ -4021,103 +4155,231 @@ class NovaTrainerPipeline:
                     scheduler,
                     resume_path,
                     torch_mod,
+                    scaler=mp.scaler,
                 )
                 last_log_tokens = tokens_seen
+                last_save_tokens = tokens_seen
             else:
                 log.warning("Resume checkpoint not found: %s", resume_path)
+        elif self.train_cfg.resume_auto and not deepspeed_engine:
+            mode = (self.train_cfg.resume_mode or "latest").lower()
+            if mode == "best":
+                auto_path = checkpoint_dir / "checkpoint_best.pt"
+            elif mode == "final":
+                auto_path = checkpoint_dir / "checkpoint_final.pt"
+            else:
+                auto_path = checkpoint_dir / "checkpoint_latest.pt"
+            if auto_path.exists():
+                step, tokens_seen = self._load_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    auto_path,
+                    torch_mod,
+                    scaler=mp.scaler,
+                )
+                last_log_tokens = tokens_seen
+                last_save_tokens = tokens_seen
+        best_path = checkpoint_dir / "checkpoint_best.pt"
+        if best_path.exists():
+            try:
+                payload = torch_mod.load(best_path, map_location="cpu")
+                best_loss = float(payload.get("loss", best_loss))
+            except Exception:
+                pass
         optimizer.zero_grad(set_to_none=True)
         loop_total = max_steps if max_steps is not None else None
-        for batch in progress(dataloader, total=loop_total, desc="train"):
-            seq = batch[0] if isinstance(batch, (list, tuple)) else batch
-            seq = seq.to(device)
-            with mp.autocast():
-                outputs = model(seq[:, :-1], labels=seq[:, 1:])
-                loss = outputs.loss / self.train_cfg.gradient_accumulation_steps
-            loss_value = float(loss.detach().cpu()) * self.train_cfg.gradient_accumulation_steps
-            if deepspeed_engine:
-                deepspeed_engine.backward(loss)
-                deepspeed_engine.step()
-            else:
-                if mp.scaler:
-                    mp.scaler.scale(loss).backward()
+        interrupted = False
+        pad_id = token_counter.pad_id()
+        if pad_id is None:
+            pad_id = 0
+        try:
+            for batch in progress(dataloader, total=loop_total, desc="train"):
+                seq = batch[0] if isinstance(batch, (list, tuple)) else batch
+                seq = seq.to(device)
+                with mp.autocast():
+                    labels = seq[:, 1:].clone()
+                    labels[labels == pad_id] = -100
+                    outputs = model(seq[:, :-1], labels=labels)
+                    loss = outputs.loss / self.train_cfg.gradient_accumulation_steps
+                if not torch_mod.isfinite(loss).all():
+                    log.warning("Non-finite loss detected at step %d; skipping step.", step)
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                loss_value = float(loss.detach().cpu()) * self.train_cfg.gradient_accumulation_steps
+                if deepspeed_engine:
+                    deepspeed_engine.backward(loss)
+                    deepspeed_engine.step()
                 else:
-                    loss.backward()
+                    if mp.scaler:
+                        mp.scaler.scale(loss).backward()
+                    else:
+                loss.backward()
             micro_norms.append(self._grad_norm(model))
             if (step + 1) % self.train_cfg.gradient_accumulation_steps == 0 and not deepspeed_engine:
-                if self.train_cfg.gradient_clip:
+                    if self.train_cfg.gradient_clip:
+                        if mp.scaler:
+                            mp.scaler.unscale_(optimizer)
+                        torch_mod.nn.utils.clip_grad_norm_(model.parameters(), self.train_cfg.gradient_clip)
                     if mp.scaler:
-                        mp.scaler.unscale_(optimizer)
-                    torch_mod.nn.utils.clip_grad_norm_(model.parameters(), self.train_cfg.gradient_clip)
-                if mp.scaler:
-                    mp.scaler.step(optimizer)
-                    mp.scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                if scheduler is not None:
-                    scheduler.step()
-                if self.grad_monitor:
-                    gns = self.grad_monitor.update(micro_norms)
-                    if gns is not None:
-                        log.info("Gradient noise scale: %.6f", gns)
-                micro_norms = []
+                        mp.scaler.step(optimizer)
+                        mp.scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scheduler is not None:
+                        scheduler.step()
+                    if self.grad_monitor:
+                        gns = self.grad_monitor.update(micro_norms)
+                        if gns is not None:
+                            log.info("Gradient noise scale: %.6f", gns)
+                    micro_norms = []
             losses.append(loss_value)
-            batch_tokens = int(seq.shape[0] * max(0, seq.shape[1] - 1))
+            if 0.0 < ema_decay < 1.0:
+                if ema_loss is None:
+                    ema_loss = loss_value
+                else:
+                    ema_loss = (ema_decay * ema_loss) + ((1.0 - ema_decay) * loss_value)
+            batch_tokens = int((labels != -100).sum().item())
             tokens_seen += batch_tokens
             step += 1
-            if self.train_cfg.log_every_n_steps and step % self.train_cfg.log_every_n_steps == 0:
+                if self.train_cfg.log_every_n_steps and step % self.train_cfg.log_every_n_steps == 0:
+                    now = time.time()
+                    interval_tokens = tokens_seen - last_log_tokens
+                    interval_time = max(1e-6, now - last_log_time)
+                    tok_per_sec = interval_tokens / interval_time
+                    ppl = math.exp(min(20.0, loss_value))
+                    log.info(
+                        "step=%d loss=%.4f ppl=%.2f tokens=%d tok/s=%.0f",
+                        step,
+                        loss_value,
+                        ppl,
+                        tokens_seen,
+                        tok_per_sec,
+                    )
+                    last_log_time = now
+                    last_log_tokens = tokens_seen
+                if self.train_cfg.log_gpu_every_n_steps and step % self.train_cfg.log_gpu_every_n_steps == 0:
+                    if torch_mod.cuda.is_available():
+                        alloc = torch_mod.cuda.memory_allocated() / (1024 ** 2)
+                        reserved = torch_mod.cuda.memory_reserved() / (1024 ** 2)
+                        log.info("gpu_mem_mb alloc=%.0f reserved=%.0f", alloc, reserved)
+                should_save = False
                 now = time.time()
-                interval_tokens = tokens_seen - last_log_tokens
-                interval_time = max(1e-6, now - last_log_time)
-                tok_per_sec = interval_tokens / interval_time
-                ppl = math.exp(min(20.0, loss_value))
-                log.info(
-                    "step=%d loss=%.4f ppl=%.2f tokens=%d tok/s=%.0f",
-                    step,
-                    loss_value,
-                    ppl,
-                    tokens_seen,
-                    tok_per_sec,
-                )
-                last_log_time = now
-                last_log_tokens = tokens_seen
-            if self.train_cfg.log_gpu_every_n_steps and step % self.train_cfg.log_gpu_every_n_steps == 0:
-                if torch_mod.cuda.is_available():
-                    alloc = torch_mod.cuda.memory_allocated() / (1024 ** 2)
-                    reserved = torch_mod.cuda.memory_reserved() / (1024 ** 2)
-                    log.info("gpu_mem_mb alloc=%.0f reserved=%.0f", alloc, reserved)
-            if step % self.train_cfg.save_every_n_steps == 0:
+                if self.train_cfg.save_every_n_steps and step % self.train_cfg.save_every_n_steps == 0:
+                    should_save = True
+                if self.train_cfg.save_every_n_tokens and (tokens_seen - last_save_tokens) >= self.train_cfg.save_every_n_tokens:
+                    should_save = True
+                if self.train_cfg.save_every_n_seconds and (now - last_save_time) >= self.train_cfg.save_every_n_seconds:
+                    should_save = True
+                if should_save:
+                    if self.train_cfg.keep_step_checkpoints:
+                    self._save_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        checkpoint_dir / f"step_{step:06d}.pt",
+                        torch_mod,
+                        scaler=mp.scaler,
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        loss=loss_value,
+                    )
+                    self._save_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        checkpoint_dir / "checkpoint_latest.pt",
+                        torch_mod,
+                        scaler=mp.scaler,
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        loss=loss_value,
+                    )
+                    if self.train_cfg.keep_last_n_checkpoints:
+                        self._prune_checkpoints(checkpoint_dir, self.train_cfg.keep_last_n_checkpoints)
+                    last_save_time = now
+                    last_save_tokens = tokens_seen
+            best_score = ema_loss if ema_loss is not None else loss_value
+            if best_score < best_loss:
+                best_loss = best_score
                 self._save_checkpoint(
                     model,
                     optimizer,
                     scheduler,
-                    checkpoint_dir / f"step_{step:06d}.pt",
+                    checkpoint_dir / "checkpoint_best.pt",
                     torch_mod,
+                    scaler=mp.scaler,
                     step=step,
                     tokens_seen=tokens_seen,
+                    loss=best_score,
                 )
             if target_tokens and tokens_seen >= target_tokens:
                 log.info("Target tokens reached: %d", tokens_seen)
                 break
             if max_steps is not None and step >= max_steps:
                 break
+        except KeyboardInterrupt:
+            interrupted = True
+            log.warning("Training interrupted; saving checkpoint...")
+            self._save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                checkpoint_dir / "checkpoint_latest.pt",
+                torch_mod,
+                scaler=mp.scaler,
+                step=step,
+                tokens_seen=tokens_seen,
+                loss=loss_value if "loss_value" in locals() else None,
+            )
+        except Exception as exc:
+            interrupted = True
+            if self.train_cfg.save_on_exception:
+                log.warning("Training failed; saving checkpoint: %s", exc)
+                self._save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    checkpoint_dir / "checkpoint_latest.pt",
+                    torch_mod,
+                    scaler=mp.scaler,
+                    step=step,
+                    tokens_seen=tokens_seen,
+                    loss=loss_value if "loss_value" in locals() else None,
+                )
+            raise
         self._save_checkpoint(
             model,
             optimizer,
             scheduler,
-            checkpoint_dir / "final.pt",
+            checkpoint_dir / "checkpoint_final.pt",
             torch_mod,
+            scaler=mp.scaler,
             step=step,
             tokens_seen=tokens_seen,
+            loss=loss_value if "loss_value" in locals() else None,
         )
         return {
             "steps": step,
             "mean_loss": round(sum(losses) / max(1, len(losses)), 6),
+            "best_loss": round(best_loss, 6) if math.isfinite(best_loss) else None,
             "checkpoints": sorted(str(path) for path in checkpoint_dir.glob("*.pt")),
+            "status": "interrupted" if interrupted else "completed",
         }
 
     @staticmethod
-    def _save_checkpoint(model, optimizer, scheduler, path: Path, torch_mod, step: int = 0, tokens_seen: int = 0):
+    def _save_checkpoint(
+        model,
+        optimizer,
+        scheduler,
+        path: Path,
+        torch_mod,
+        scaler: Optional[Any] = None,
+        step: int = 0,
+        tokens_seen: int = 0,
+        loss: Optional[float] = None,
+    ):
         payload = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -4126,9 +4388,18 @@ class NovaTrainerPipeline:
         }
         if scheduler is not None:
             payload["scheduler"] = scheduler.state_dict()
-        torch_mod.save(payload, path)
+        if scaler is not None:
+            try:
+                payload["scaler"] = scaler.state_dict()
+            except Exception:
+                pass
+        if loss is not None:
+            payload["loss"] = float(loss)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        torch_mod.save(payload, tmp_path)
+        tmp_path.replace(path)
 
-    def _load_checkpoint(self, model, optimizer, scheduler, path: Path, torch_mod) -> Tuple[int, int]:
+    def _load_checkpoint(self, model, optimizer, scheduler, path: Path, torch_mod, scaler: Optional[Any] = None) -> Tuple[int, int]:
         payload = torch_mod.load(path, map_location="cpu")
         strict = self.train_cfg.resume_strict
         try:
@@ -4145,10 +4416,28 @@ class NovaTrainerPipeline:
                 scheduler.load_state_dict(payload["scheduler"])
             except Exception as exc:
                 log.warning("Scheduler resume failed: %s", exc)
+        if self.train_cfg.resume_scaler and scaler is not None and payload.get("scaler") is not None:
+            try:
+                scaler.load_state_dict(payload["scaler"])
+            except Exception as exc:
+                log.warning("Scaler resume failed: %s", exc)
         step = int(payload.get("step", 0))
         tokens_seen = int(payload.get("tokens_seen", 0))
         log.info("Resumed from checkpoint step=%d tokens=%d", step, tokens_seen)
         return step, tokens_seen
+
+    @staticmethod
+    def _prune_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
+        if keep_last <= 0:
+            return
+        step_paths = sorted(checkpoint_dir.glob("step_*.pt"))
+        if len(step_paths) <= keep_last:
+            return
+        for path in step_paths[:-keep_last]:
+            try:
+                path.unlink()
+            except Exception as exc:
+                log.warning("Failed to remove old checkpoint %s: %s", path, exc)
 
 
 # =============================================================================
@@ -4739,6 +5028,10 @@ class InferenceConfig:
     top_k: int = 50
     top_p: float = 0.9
     repetition_penalty: float = 1.1
+    enable_kv_cache_reuse: bool = True
+    stop_on_eos: bool = True
+    stream_chunk_size: int = 32
+    min_tokens_before_eos: int = 1
 
 
 class MemoryManager:
@@ -4869,12 +5162,17 @@ class InferenceEngine:
         "creative": {"top_k": 100, "top_p": 0.95, "repetition_penalty": 1.05, "temperature": 0.9},
         "strict": {"top_k": 20, "top_p": 0.8, "repetition_penalty": 1.2, "temperature": 0.5},
     }
+    _SANITIZE_RE = re.compile(r"[\\r\\t]+")
 
     def __init__(self, config: InferenceConfig):
         self.config = config
         self._loaded = False
         self._backend: Dict[str, Any] = {}
         self.memory = MemoryManager()
+
+    @staticmethod
+    def _sanitize_prompt(prompt: str) -> str:
+        return InferenceEngine._SANITIZE_RE.sub(" ", prompt).strip()
 
     def generate(
         self,
@@ -4908,8 +5206,12 @@ class InferenceEngine:
         top_p = self.config.top_p if top_p is None else top_p
         repetition_penalty = self.config.repetition_penalty if repetition_penalty is None else repetition_penalty
         max_new_tokens = self.memory.suggest_max_new_tokens(max_new_tokens)
+        max_input_len = max(1, self.config.max_model_len - max_new_tokens)
         if isinstance(prompt, list):
-            return self._batch_generate(prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty)
+            prompt = [self._sanitize_prompt(p) for p in prompt]
+            return self._batch_generate(prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty, max_input_len)
+        if isinstance(prompt, str):
+            prompt = self._sanitize_prompt(prompt)
         if self.config.enable_speculative and backend.get("draft_model"):
             decoder = SpeculativeDecoder(backend["model"], backend["draft_model"], backend["tokenizer"])
             return decoder.generate(
@@ -4935,8 +5237,10 @@ class InferenceEngine:
         model = backend["model"]
         torch_mod = backend["torch"]
         device = backend["device"]
-        encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.max_model_len)
+        encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_len)
         encoded = {key: value.to(device) for key, value in encoded.items()}
+        if self.config.enable_kv_cache_reuse:
+            backend["kv_cache"] = None
         with torch_mod.no_grad():
             output = model.generate(
                 **encoded,
@@ -4950,6 +5254,121 @@ class InferenceEngine:
             )
         return tokenizer.decode(output[0], skip_special_tokens=True)
 
+    def generate_stream(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        preset: Optional[str] = None,
+    ) -> Iterator[str]:
+        self._ensure_loaded()
+        backend = self._backend
+        if not backend:
+            raise RuntimeError("Inference backend was not initialized.")
+        if self.config.backend == "vllm":
+            yield self.generate(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                preset=preset,
+            )
+            return
+        transformers_mod = optional_import("transformers")
+        if not transformers_mod or not hasattr(transformers_mod, "TextIteratorStreamer"):
+            yield self.generate(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                preset=preset,
+            )
+            return
+        temperature = self.config.temperature if temperature is None else temperature
+        top_k = self.config.top_k if top_k is None else top_k
+        top_p = self.config.top_p if top_p is None else top_p
+        repetition_penalty = self.config.repetition_penalty if repetition_penalty is None else repetition_penalty
+        if preset:
+            preset_cfg = self.PRESETS.get(preset.lower())
+            if preset_cfg:
+                temperature = preset_cfg.get("temperature", temperature)
+                top_k = preset_cfg.get("top_k", top_k)
+                top_p = preset_cfg.get("top_p", top_p)
+                repetition_penalty = preset_cfg.get("repetition_penalty", repetition_penalty)
+        tokenizer = backend["tokenizer"]
+        model = backend["model"]
+        torch_mod = backend["torch"]
+        device = backend["device"]
+        max_input_len = max(1, self.config.max_model_len - max_new_tokens)
+        encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_len)
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        eos_id = tokenizer.eos_token_id
+        past = None
+        buffer = []
+        for idx in range(max_new_tokens):
+            step_input = input_ids if (past is None or not self.config.enable_kv_cache_reuse) else input_ids[:, -1:]
+            step_mask = attention_mask if (past is None or not self.config.enable_kv_cache_reuse) else attention_mask[:, -1:] if attention_mask is not None else None
+            outputs = model(step_input, attention_mask=step_mask, use_cache=self.config.enable_kv_cache_reuse, past_key_values=past)
+            logits = outputs.logits[:, -1, :]
+            past = outputs.past_key_values if self.config.enable_kv_cache_reuse else None
+            if temperature <= 0:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+            else:
+                logits = logits / max(temperature, 1e-5)
+                if repetition_penalty and repetition_penalty != 1.0:
+                    for token_id in torch_mod.unique(input_ids):
+                        idx = int(token_id.item())
+                        token_logits = logits[..., idx]
+                        logits[..., idx] = torch_mod.where(
+                            token_logits < 0,
+                            token_logits * repetition_penalty,
+                            token_logits / repetition_penalty,
+                        )
+                if top_k and top_k > 0:
+                    values, indices = torch_mod.topk(logits, k=top_k, dim=-1)
+                    logits = torch_mod.full_like(logits, float("-inf")).scatter(-1, indices, values)
+                if top_p and top_p < 1.0:
+                    sorted_logits, sorted_indices = torch_mod.sort(logits, descending=True)
+                    probs = torch_mod.softmax(sorted_logits, dim=-1)
+                    cumulative = torch_mod.cumsum(probs, dim=-1)
+                    sorted_mask = cumulative > top_p
+                    sorted_mask[..., 0] = False
+                    sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+                    logits = torch_mod.zeros_like(logits).scatter(-1, sorted_indices, sorted_logits)
+                probs = torch_mod.softmax(logits, dim=-1)
+                next_token = torch_mod.multinomial(probs, num_samples=1)
+            input_ids = torch_mod.cat([input_ids, next_token], dim=-1)
+            if attention_mask is not None:
+                attention_mask = torch_mod.cat([attention_mask, torch_mod.ones_like(next_token)], dim=-1)
+            text = tokenizer.decode(next_token[0], skip_special_tokens=True)
+            if text:
+                buffer.append(text)
+                if len(buffer) >= max(1, self.config.stream_chunk_size):
+                    yield "".join(buffer)
+                    buffer = []
+            if self.config.stop_on_eos and eos_id is not None and int(next_token.item()) == int(eos_id):
+                if idx < self.config.min_tokens_before_eos:
+                    continue
+                if buffer:
+                    yield "".join(buffer)
+                break
+            if idx == max_new_tokens - 1 and buffer:
+                yield "".join(buffer)
+            if input_ids.size(1) >= self.config.max_model_len:
+                if buffer:
+                    yield "".join(buffer)
+                break
+
     def _batch_generate(
         self,
         prompts: List[str],
@@ -4958,6 +5377,7 @@ class InferenceEngine:
         top_k: int,
         top_p: float,
         repetition_penalty: float,
+        max_input_len: int,
     ) -> List[str]:
         backend = self._backend
         if not backend:
@@ -4966,7 +5386,7 @@ class InferenceEngine:
         model = backend["model"]
         torch_mod = backend["torch"]
         device = backend["device"]
-        encoded = tokenizer(prompts, return_tensors="pt", truncation=True, padding=True, max_length=self.config.max_model_len)
+        encoded = tokenizer(prompts, return_tensors="pt", truncation=True, padding=True, max_length=max_input_len)
         encoded = {key: value.to(device) for key, value in encoded.items()}
         with torch_mod.no_grad():
             output = model.generate(
@@ -5013,6 +5433,8 @@ class InferenceEngine:
             kwargs["load_in_4bit"] = quant == "int4"
             kwargs["device_map"] = "auto"
         tokenizer = transformers_mod.AutoTokenizer.from_pretrained(self.config.model_name_or_path)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
         model = transformers_mod.AutoModelForCausalLM.from_pretrained(self.config.model_name_or_path, **kwargs)
         device = "cuda" if torch_mod.cuda.is_available() else "cpu"
         if device == "cpu" and quant == "int8_dynamic":
@@ -5024,7 +5446,14 @@ class InferenceEngine:
             draft_model = transformers_mod.AutoModelForCausalLM.from_pretrained(self.config.draft_model_name_or_path)
             draft_model.to(device)
             draft_model.eval()
-        self._backend = {"tokenizer": tokenizer, "model": model, "draft_model": draft_model, "torch": torch_mod, "device": device}
+        self._backend = {
+            "tokenizer": tokenizer,
+            "model": model,
+            "draft_model": draft_model,
+            "torch": torch_mod,
+            "device": device,
+            "kv_cache": None,
+        }
 
 
 # =============================================================================
@@ -5236,6 +5665,11 @@ class NovaTitanOrchestratorV3(NovaTitanOrchestrator):
         self.train_cfg.resume_from = os.getenv("NOVA_RESUME_FROM", "")
         self.train_cfg.resume_optimizer = os.getenv("NOVA_RESUME_OPT", "1") == "1"
         self.train_cfg.resume_scheduler = os.getenv("NOVA_RESUME_SCHED", "1") == "1"
+        self.train_cfg.resume_auto = os.getenv("NOVA_RESUME_AUTO", "1") == "1"
+        self.train_cfg.resume_mode = os.getenv("NOVA_RESUME_MODE", "latest")
+        self.train_cfg.save_every_n_seconds = int(os.getenv("NOVA_SAVE_EVERY_SECS", "0") or 0)
+        self.train_cfg.save_every_n_tokens = int(os.getenv("NOVA_SAVE_EVERY_TOKENS", "0") or 0)
+        self.train_cfg.keep_last_n_checkpoints = int(os.getenv("NOVA_KEEP_LAST_CHECKPOINTS", "0") or 0)
         self.trainer = NovaTrainerPipeline(self.model_cfg, self.train_cfg)
         self.packer = ContextPacker(context_window=self.model_cfg.max_seq_len, overlap=512)
         self.evaluator = Evaluator()
