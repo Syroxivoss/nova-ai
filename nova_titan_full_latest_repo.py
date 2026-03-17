@@ -4589,6 +4589,9 @@ class InferenceConfig:
     enable_continuous_batching: bool = False
     quantization: str = ""
     max_batch_size: int = 8
+    top_k: int = 0
+    top_p: float = 1.0
+    repetition_penalty: float = 1.0
 
 
 class MemoryManager:
@@ -4611,32 +4614,98 @@ class SpeculativeDecoder:
         self.draft_model = draft_model
         self.tokenizer = tokenizer
 
-    def generate(self, prompt: str, max_new_tokens: int, temperature: float = 0.7, draft_tokens: int = 4) -> str:
+    @staticmethod
+    def _apply_repetition_penalty(logits, input_ids, penalty: float):
+        if penalty is None or penalty == 1.0:
+            return logits
+        import torch
+        unique_tokens = torch.unique(input_ids)
+        for token_id in unique_tokens:
+            idx = int(token_id.item())
+            token_logits = logits[..., idx]
+            logits[..., idx] = torch.where(token_logits < 0, token_logits * penalty, token_logits / penalty)
+        return logits
+
+    @staticmethod
+    def _filter_top_k_top_p(logits, top_k: int, top_p: float):
+        import torch
+        if top_k and top_k > 0:
+            top_k = min(top_k, logits.size(-1))
+            values, _ = torch.topk(logits, top_k)
+            min_values = values[..., -1, None]
+            logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
+        if top_p and 0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(probs, dim=-1)
+            sorted_mask = cumulative_probs > top_p
+            sorted_mask[..., 0] = False
+            sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+            logits = torch.zeros_like(logits).scatter(-1, sorted_indices, sorted_logits)
+        return logits
+
+    def _sample_next_token(
+        self,
+        logits,
+        input_ids,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ):
+        import torch
+        if temperature <= 0:
+            return logits.argmax(dim=-1)
+        logits = logits / max(temperature, 1e-5)
+        logits = self._apply_repetition_penalty(logits, input_ids, repetition_penalty)
+        logits = self._filter_top_k_top_p(logits, top_k, top_p)
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(1)
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float = 0.7,
+        draft_tokens: int = 4,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+    ) -> str:
         torch_mod = optional_import("torch")
+        if not torch_mod:
+            raise RuntimeError("Install torch to use speculative decoding.")
         device = next(self.target_model.parameters()).device
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        prompt_len = input_ids.size(1)
         for _ in range(max_new_tokens):
             draft_out = self.draft_model.generate(
                 input_ids,
                 max_new_tokens=draft_tokens,
                 do_sample=temperature > 0,
                 temperature=temperature,
+                top_k=top_k if top_k and top_k > 0 else None,
+                top_p=top_p if top_p and top_p < 1.0 else None,
+                repetition_penalty=repetition_penalty if repetition_penalty and repetition_penalty != 1.0 else None,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
             proposed = draft_out[0, input_ids.size(1):]
             for token in proposed:
                 logits = self.target_model(input_ids).logits[:, -1, :]
-                if temperature <= 0:
-                    next_token = logits.argmax(dim=-1)
-                else:
-                    probs = _TORCH.softmax(logits / max(temperature, 1e-5), dim=-1)
-                    next_token = _TORCH.multinomial(probs, num_samples=1).squeeze(1)
+                next_token = self._sample_next_token(
+                    logits,
+                    input_ids,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                )
                 input_ids = _TORCH.cat([input_ids, next_token.unsqueeze(1)], dim=-1)
                 if next_token.item() != token.item():
                     break
-                if input_ids.size(1) - self.tokenizer(prompt, return_tensors="pt").input_ids.size(1) >= max_new_tokens:
+                if input_ids.size(1) - prompt_len >= max_new_tokens:
                     break
-            if input_ids.size(1) - self.tokenizer(prompt, return_tensors="pt").input_ids.size(1) >= max_new_tokens:
+            if input_ids.size(1) - prompt_len >= max_new_tokens:
                 break
         return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
@@ -4648,19 +4717,44 @@ class InferenceEngine:
         self._backend: Dict[str, Any] = {}
         self.memory = MemoryManager()
 
-    def generate(self, prompt: Any, max_new_tokens: int = 256, temperature: float = 0.7) -> Any:
+    def generate(
+        self,
+        prompt: Any,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+    ) -> Any:
         self._ensure_loaded()
         backend = self._backend
         if not backend:
             raise RuntimeError("Inference backend was not initialized.")
+        top_k = self.config.top_k if top_k is None else top_k
+        top_p = self.config.top_p if top_p is None else top_p
+        repetition_penalty = self.config.repetition_penalty if repetition_penalty is None else repetition_penalty
         max_new_tokens = self.memory.suggest_max_new_tokens(max_new_tokens)
         if isinstance(prompt, list):
-            return self._batch_generate(prompt, max_new_tokens, temperature)
+            return self._batch_generate(prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty)
         if self.config.enable_speculative and backend.get("draft_model"):
             decoder = SpeculativeDecoder(backend["model"], backend["draft_model"], backend["tokenizer"])
-            return decoder.generate(prompt, max_new_tokens=max_new_tokens, temperature=temperature)
+            return decoder.generate(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k or 0,
+                top_p=top_p or 1.0,
+                repetition_penalty=repetition_penalty or 1.0,
+            )
         if self.config.backend == "vllm":
-            sampling = backend["sampling_cls"](temperature=temperature, max_tokens=max_new_tokens)
+            sampling_kwargs = {"temperature": temperature, "max_tokens": max_new_tokens}
+            if top_k and top_k > 0:
+                sampling_kwargs["top_k"] = top_k
+            if top_p and top_p < 1.0:
+                sampling_kwargs["top_p"] = top_p
+            if repetition_penalty and repetition_penalty != 1.0:
+                sampling_kwargs["repetition_penalty"] = repetition_penalty
+            sampling = backend["sampling_cls"](**sampling_kwargs)
             outputs = backend["llm"].generate([prompt], sampling)
             return outputs[0].outputs[0].text.strip()
         tokenizer = backend["tokenizer"]
@@ -4674,12 +4768,23 @@ class InferenceEngine:
                 **encoded,
                 do_sample=temperature > 0,
                 temperature=temperature,
+                top_k=top_k or 0,
+                top_p=top_p or 1.0,
+                repetition_penalty=repetition_penalty or 1.0,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.eos_token_id,
             )
         return tokenizer.decode(output[0], skip_special_tokens=True)
 
-    def _batch_generate(self, prompts: List[str], max_new_tokens: int, temperature: float) -> List[str]:
+    def _batch_generate(
+        self,
+        prompts: List[str],
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> List[str]:
         backend = self._backend
         if not backend:
             raise RuntimeError("Inference backend was not initialized.")
@@ -4694,6 +4799,9 @@ class InferenceEngine:
                 **encoded,
                 do_sample=temperature > 0,
                 temperature=temperature,
+                top_k=top_k or 0,
+                top_p=top_p or 1.0,
+                repetition_penalty=repetition_penalty or 1.0,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.eos_token_id,
             )
