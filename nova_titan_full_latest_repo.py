@@ -32,7 +32,7 @@ from collections import defaultdict, Counter, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from itertools import islice
+from itertools import islice, chain
 from typing import Iterator, Optional, List, Dict, Tuple, Any, Sequence, Iterable, TypeAlias
 from urllib.parse import urljoin, urlparse
 
@@ -415,23 +415,32 @@ class DatasetImporter:
 
         for record in islice(dataset, self.max_documents):
             parts = []
+            fields_payload: Dict[str, Any] = {}
             for field in cfg.get("fields", ("text",)):
                 value = record.get(field)
                 if isinstance(value, str) and value.strip():
                     parts.append(value.strip())
+                    fields_payload[field] = value.strip()
             text_value = "\n\n".join(parts)
             if len(text_value) < 40:
                 continue
+            metadata = {
+                key: record.get(key)
+                for key in ("lang", "license", "max_stars_count", "path")
+                if key in record
+            }
+            if fields_payload:
+                metadata["fields"] = fields_payload
+                if len(fields_payload) >= 2:
+                    field_items = list(fields_payload.items())
+                    metadata["question"] = field_items[0][1]
+                    metadata["answer"] = field_items[1][1]
             yield RawDocument(
                 source=source.value,
                 category=cfg.get("category", self._cat(source)),
                 language=str(record.get("lang", "unknown")),
                 text=text_value,
-                metadata={
-                    key: record.get(key)
-                    for key in ("lang", "license", "max_stars_count", "path")
-                    if key in record
-                },
+                metadata=metadata,
             )
 
     @staticmethod
@@ -1340,6 +1349,86 @@ class RLHFPipeline:
                  len(self.sft_dataset), len(self.preference_dataset))
 
 
+class InstructionDatasetBuilder:
+    """Converts cleaned documents into simple instruction/response pairs."""
+    def __init__(self, max_assistant_chars: int = 1200, min_text_chars: int = 160):
+        self.max_assistant_chars = max_assistant_chars
+        self.min_text_chars = min_text_chars
+
+    def build_from_document(self, doc: RawDocument) -> List[InstructionExample]:
+        qa = self._extract_qa(doc)
+        if qa:
+            question, answer = qa
+            return [InstructionExample(
+                system=self._system_for(doc),
+                user=question,
+                assistant=answer,
+                source=doc.source,
+            )]
+        if doc.category == "code_ast":
+            return []
+        summary = self._summarize(doc.text)
+        if not summary:
+            return []
+        return [InstructionExample(
+            system=self._system_for(doc),
+            user=self._prompt_for(doc),
+            assistant=summary,
+            source=doc.source,
+        )]
+
+    def _extract_qa(self, doc: RawDocument) -> Optional[Tuple[str, str]]:
+        meta = doc.metadata or {}
+        question = meta.get("question")
+        answer = meta.get("answer")
+        if isinstance(question, str) and isinstance(answer, str) and question.strip() and answer.strip():
+            return question.strip(), answer.strip()
+        text = doc.text or ""
+        if "Question:" in text and "Answer:" in text:
+            parts = re.split(r"\bAnswer:\s*", text, maxsplit=1)
+            if len(parts) == 2:
+                q = re.sub(r"^Question:\s*", "", parts[0]).strip()
+                a = parts[1].strip()
+                if q and a:
+                    return q, a
+        return None
+
+    def _summarize(self, text: str) -> str:
+        if not text or len(text) < self.min_text_chars:
+            return ""
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        out = []
+        total = 0
+        for sent in sentences:
+            if not sent:
+                continue
+            if total + len(sent) > self.max_assistant_chars and out:
+                break
+            out.append(sent)
+            total += len(sent) + 1
+            if total >= self.max_assistant_chars:
+                break
+        return " ".join(out).strip()
+
+    def _system_for(self, doc: RawDocument) -> str:
+        if doc.category == "math_reasoning":
+            return RLHFPipeline.SYSTEM_PROMPTS["math"]
+        if doc.category == "cyber_sec":
+            return RLHFPipeline.SYSTEM_PROMPTS["security"]
+        if doc.category == "code_ast":
+            return RLHFPipeline.SYSTEM_PROMPTS["code"]
+        return RLHFPipeline.SYSTEM_PROMPTS["general"]
+
+    def _prompt_for(self, doc: RawDocument) -> str:
+        if doc.category == "cyber_sec":
+            return "Summarize the vulnerability, its impact, and mitigation steps."
+        if doc.category == "science":
+            return "Summarize the research text in plain language."
+        if doc.category == "math_reasoning":
+            return "Explain the solution step by step."
+        return "Summarize the text and list key points."
+
+
 # =============================================================================
 # MODULE 16 — SAFETY DATASET
 # =============================================================================
@@ -1838,7 +1927,11 @@ class StackExchangeParser:
                             language="en",
                             text=text_value,
                             title=question["title"],
-                            metadata={"tags": question["tags"]},
+                            metadata={
+                                "tags": question["tags"],
+                                "question": question["title"] + "\n" + question["body"],
+                                "answer": body,
+                            },
                         )
             elem.clear()
 
@@ -2059,6 +2152,8 @@ class NovaTitanOrchestrator:
         self.evaluator = Evaluator()
         self.rlhf = RLHFPipeline()
         self.tool_builder = ToolUseDatasetBuilder()
+        self.instruction_builder = InstructionDatasetBuilder()
+        self.instruction_shards = InstructionShardManager(shard_size_tokens=200_000_000)
         self.version_mgr = DatasetVersionManager(self.base_dir)
         self.stats = PipelineStats()
 
@@ -2113,8 +2208,7 @@ class NovaTitanOrchestrator:
             return ("quality", None)
         return ("ok", cleaned)
 
-    def process_stream(self, data_stream: Iterator[RawDocument]) -> List[RawDocument]:
-        accepted = []
+    def stream_processed(self, data_stream: Iterator[RawDocument]) -> Iterator[RawDocument]:
         for status, doc in self.parallel.map(data_stream, self._prepare_document):
             self.stats.total_docs += 1
             if status != "ok" or doc is None:
@@ -2133,10 +2227,12 @@ class NovaTitanOrchestrator:
             if self.balancer.add_document(doc):
                 self.stats.tokens_by_category[doc.category] += doc.token_count
                 self.stats.docs_by_source[doc.source] += 1
-                accepted.append(doc)
+                yield doc
             else:
                 self.stats.reject("category_balance")
-        return accepted
+
+    def process_stream(self, data_stream: Iterator[RawDocument]) -> List[RawDocument]:
+        return list(self.stream_processed(data_stream))
 
     def execute_pipeline(self, version: str = "v2.0") -> Dict:
         log.info("=" * 60)
@@ -2144,17 +2240,63 @@ class NovaTitanOrchestrator:
         log.info("Model: %s", self.model_cfg.summary())
         log.info("%s", self.compute.report())
 
-        processed_docs = self.process_stream(self._collect_all())
-        sorted_docs = self.curriculum.sort_dataset(processed_docs)
-        packed_chunks = list(self.packer.pack(sorted_docs))
+        use_streaming = os.getenv("NOVA_STREAMING", "1") == "1"
+        buffer_docs = int(os.getenv("NOVA_CURRICULUM_BUFFER_DOCS", "800"))
+        sample_limit = int(os.getenv("NOVA_TRAIN_SAMPLE_CHUNKS", "5000"))
 
         corpus_dir = self.base_dir / "corpus_shards"
-        n_shards = self.shard_mgr.write_shards(iter(packed_chunks), corpus_dir)
-
         tokenizer_corpus = self.base_dir / "tokenizer_corpus.txt"
-        with open(tokenizer_corpus, "w", encoding="utf-8") as handle:
-            for chunk in packed_chunks:
-                handle.write(chunk.text.replace("\n", " ") + "\n")
+        instruction_dir = self.base_dir / "instruction_shards"
+
+        self.instruction_shards.open(instruction_dir)
+        packed_chunks: List[DocumentChunk] = []
+        processed_docs_count = 0
+        chunk_counter = 0
+
+        def _flush_buffer(buf: List[RawDocument], tokenizer_handle) -> Iterator[DocumentChunk]:
+            nonlocal chunk_counter
+            sorted_docs = self.curriculum.sort_dataset(buf)
+            for chunk in self.packer.pack(sorted_docs):
+                tokenizer_handle.write(chunk.text.replace("\n", " ") + "\n")
+                if len(packed_chunks) < sample_limit:
+                    packed_chunks.append(chunk)
+                chunk_counter += 1
+                yield chunk
+
+        if use_streaming:
+            processed_iter = self.stream_processed(self._collect_all())
+
+            def chunk_iter(tokenizer_handle):
+                nonlocal processed_docs_count
+                buffer: List[RawDocument] = []
+                for doc in processed_iter:
+                    processed_docs_count += 1
+                    for ex in self.instruction_builder.build_from_document(doc):
+                        self.instruction_shards.write_example(ex)
+                    buffer.append(doc)
+                    if len(buffer) >= buffer_docs:
+                        yield from _flush_buffer(buffer, tokenizer_handle)
+                        buffer.clear()
+                if buffer:
+                    yield from _flush_buffer(buffer, tokenizer_handle)
+
+            with open(tokenizer_corpus, "w", encoding="utf-8") as handle:
+                n_shards = self.shard_mgr.write_shards(chunk_iter(handle), corpus_dir)
+        else:
+            processed_docs = self.process_stream(self._collect_all())
+            processed_docs_count = len(processed_docs)
+            for doc in processed_docs:
+                for ex in self.instruction_builder.build_from_document(doc):
+                    self.instruction_shards.write_example(ex)
+            sorted_docs = self.curriculum.sort_dataset(processed_docs)
+            packed_chunks = list(self.packer.pack(sorted_docs))
+            chunk_counter = len(packed_chunks)
+            n_shards = self.shard_mgr.write_shards(iter(packed_chunks), corpus_dir)
+            with open(tokenizer_corpus, "w", encoding="utf-8") as handle:
+                for chunk in packed_chunks:
+                    handle.write(chunk.text.replace("\n", " ") + "\n")
+
+        instruction_stats = self.instruction_shards.close()
 
         tokenizer_trainer = BPETokenizerTrainer(self.tokenizer_cfg)
         tok_result = tokenizer_trainer.train(tokenizer_corpus)
@@ -2193,14 +2335,18 @@ class NovaTitanOrchestrator:
 
         retrieval_manifest = self.base_dir / "retrieval_corpus.jsonl"
         with open(retrieval_manifest, "w", encoding="utf-8") as handle:
-            for chunk in packed_chunks:
-                handle.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
+            if use_streaming:
+                for chunk in self.shard_mgr.stream_shards():
+                    handle.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
+            else:
+                for chunk in packed_chunks:
+                    handle.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
 
         print(self.stats.report())
         stats_dict = {
             "total_docs": self.stats.total_docs,
-            "accepted_docs": len(processed_docs),
-            "corpus_chunks": len(packed_chunks),
+            "accepted_docs": processed_docs_count,
+            "corpus_chunks": chunk_counter,
             "n_shards": n_shards,
             "tokens_by_category": dict(self.stats.tokens_by_category),
             "docs_by_source": dict(self.stats.docs_by_source),
@@ -2208,10 +2354,11 @@ class NovaTitanOrchestrator:
             "tokenizer": tok_result,
             "training_plan": training_info,
             "training_run": training_run,
+            "instruction_shards": instruction_stats,
         }
         self.version_mgr.register(version, stats_dict, notes="productionized pipeline update")
         return {
-            "corpus_chunks": len(packed_chunks),
+            "corpus_chunks": chunk_counter,
             "n_shards": n_shards,
             "eval": {
                 name: {"score": result.score, "status": result.status, "target": result.target}
@@ -2220,6 +2367,7 @@ class NovaTitanOrchestrator:
             "tokenizer": tok_result,
             "training": training_run or training_info,
             "retrieval_manifest": str(retrieval_manifest),
+            "instruction_shards": {"dir": str(instruction_dir), "splits": instruction_stats},
             "stats": stats_dict,
         }
 
@@ -2709,6 +2857,101 @@ class DatasetShardManager:
             current_tokens += chunk.token_count
         flush()
         return shard_idx
+
+
+class InstructionShardManager:
+    """Shards instruction examples into train/val/test JSONL splits."""
+    def __init__(
+        self,
+        shard_size_tokens: int = 200_000_000,
+        split_ratios: Optional[Dict[str, float]] = None,
+        seed: int = 42,
+    ):
+        self.shard_size_tokens = shard_size_tokens
+        self.split_ratios = split_ratios or {"train": 0.90, "val": 0.05, "test": 0.05}
+        self.rng = random.Random(seed)
+        self._writers: Dict[str, "_InstructionShardWriter"] = {}
+
+    def open(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._writers = {}
+        for split in self.split_ratios:
+            self._writers[split] = _InstructionShardWriter(
+                output_dir / split,
+                shard_size_tokens=self.shard_size_tokens,
+                split_name=split,
+            )
+
+    def write_example(self, ex: InstructionExample) -> None:
+        split = self._pick_split()
+        writer = self._writers.get(split)
+        if not writer:
+            return
+        writer.write(ex)
+
+    def close(self) -> Dict[str, int]:
+        counts = {}
+        for split, writer in self._writers.items():
+            counts[split] = writer.close()
+        self._writers = {}
+        return counts
+
+    def _pick_split(self) -> str:
+        roll = self.rng.random()
+        cumulative = 0.0
+        for split, ratio in self.split_ratios.items():
+            cumulative += ratio
+            if roll <= cumulative:
+                return split
+        return "train"
+
+
+class _InstructionShardWriter:
+    def __init__(self, output_dir: Path, shard_size_tokens: int, split_name: str):
+        self.output_dir = output_dir
+        self.shard_size_tokens = shard_size_tokens
+        self.split_name = split_name
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._handle = None
+        self._shard_idx = 0
+        self._current_tokens = 0
+
+    def write(self, ex: InstructionExample) -> None:
+        text = self._format_text(ex)
+        token_count = estimate_tokens(text)
+        if self._handle is None or self._current_tokens + token_count > self.shard_size_tokens:
+            self._rotate()
+        row = {
+            "text": text,
+            "system": ex.system,
+            "user": ex.user,
+            "assistant": ex.assistant,
+            "source": ex.source,
+            "token_count": token_count,
+        }
+        self._handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._current_tokens += token_count
+
+    def close(self) -> int:
+        if self._handle and not self._handle.closed:
+            self._handle.close()
+        return self._shard_idx
+
+    def _rotate(self) -> None:
+        if self._handle:
+            self._handle.close()
+        shard_path = self.output_dir / f"{self.split_name}_shard_{self._shard_idx:05d}.jsonl"
+        self._handle = open(shard_path, "w", encoding="utf-8")
+        self._shard_idx += 1
+        self._current_tokens = 0
+
+    @staticmethod
+    def _format_text(ex: InstructionExample) -> str:
+        return (
+            f"[SYS]{ex.system}[/SYS]\n"
+            f"[USER]{ex.user}[/USER]\n"
+            f"[ASSISTANT]{ex.assistant}[/ASSISTANT]"
+        )
 
 
 class ParallelDataPipeline:
@@ -3435,7 +3678,8 @@ class NovaTrainerPipeline:
             if not ids:
                 continue
             if vocab_size and max(ids) >= vocab_size:
-                ids = [token % vocab_size for token in ids]
+                unk_id = 1
+                ids = [token if token < vocab_size else unk_id for token in ids]
             if len(ids) < 16:
                 continue
             for start in range(0, len(ids) - 1, self.model_cfg.max_seq_len):
@@ -3563,26 +3807,74 @@ class NovaTrainerPipeline:
         dist.init_process_group(torch_mod)
         device = dist.device(torch_mod)
         vocab_size = self.model_cfg.vocab_size
-        sequences = list(islice(self._iter_sequences(chunks, token_counter, vocab_size), self.train_cfg.max_train_sequences))
-        if not sequences:
-            raise RuntimeError("No training sequences were produced.")
-        if self.train_cfg.dynamic_batch_size:
-            auto_batch = AutoBatchOptimizer(self.train_cfg.max_batch_size, self.train_cfg.min_batch_size, self.train_cfg.auto_batch_max_trials)
-            model_probe = self._build_model(torch_mod, vocab_size).to(device)
-            probe_tensors = [_TORCH.tensor(seq, dtype=_TORCH.long) for seq in sequences[: min(len(sequences), self.train_cfg.max_batch_size)]]
-            tuned = auto_batch.tune(probe_tensors, model_probe, device)
-            self.train_cfg.batch_size_per_gpu = tuned
-            del model_probe
-            torch_mod.cuda.empty_cache() if device == "cuda" else None
+        if self.train_cfg.streaming:
+            seq_iter = self._iter_sequences(chunks, token_counter, vocab_size)
+            warmup_count = min(self.train_cfg.max_batch_size, self.train_cfg.max_train_sequences)
+            warmup = list(islice(seq_iter, warmup_count))
+            if not warmup:
+                raise RuntimeError("No training sequences were produced.")
+            if self.train_cfg.dynamic_batch_size:
+                auto_batch = AutoBatchOptimizer(self.train_cfg.max_batch_size, self.train_cfg.min_batch_size, self.train_cfg.auto_batch_max_trials)
+                model_probe = self._build_model(torch_mod, vocab_size).to(device)
+                probe_tensors = [_TORCH.tensor(seq, dtype=_TORCH.long) for seq in warmup[: min(len(warmup), self.train_cfg.max_batch_size)]]
+                tuned = auto_batch.tune(probe_tensors, model_probe, device)
+                self.train_cfg.batch_size_per_gpu = tuned
+                del model_probe
+                torch_mod.cuda.empty_cache() if device == "cuda" else None
 
-        dataset = torch_mod.utils.data.TensorDataset(torch_mod.tensor(sequences, dtype=torch_mod.long))
-        dataloader = torch_mod.utils.data.DataLoader(
-            dataset,
-            batch_size=self.train_cfg.batch_size_per_gpu,
-            shuffle=True,
-            num_workers=self.train_cfg.dataloader_workers,
-            drop_last=True,
-        )
+            def _shuffle_buffer(iterator: Iterator[List[int]], buffer_size: int) -> Iterator[List[int]]:
+                if buffer_size <= 0:
+                    yield from iterator
+                    return
+                buf: List[List[int]] = []
+                for item in iterator:
+                    buf.append(item)
+                    if len(buf) >= buffer_size:
+                        random.shuffle(buf)
+                        while buf:
+                            yield buf.pop()
+                if buf:
+                    random.shuffle(buf)
+                    while buf:
+                        yield buf.pop()
+
+            full_iter = islice(chain(warmup, seq_iter), self.train_cfg.max_train_sequences)
+            full_iter = _shuffle_buffer(full_iter, self.train_cfg.shuffle_buffer)
+
+            class _SequenceDataset(torch_mod.utils.data.IterableDataset):
+                def __iter__(self):
+                    for seq in full_iter:
+                        yield torch_mod.tensor(seq, dtype=torch_mod.long)
+
+            dataset = _SequenceDataset()
+            dataloader = torch_mod.utils.data.DataLoader(
+                dataset,
+                batch_size=self.train_cfg.batch_size_per_gpu,
+                shuffle=False,
+                num_workers=0,
+                drop_last=True,
+            )
+        else:
+            sequences = list(islice(self._iter_sequences(chunks, token_counter, vocab_size), self.train_cfg.max_train_sequences))
+            if not sequences:
+                raise RuntimeError("No training sequences were produced.")
+            if self.train_cfg.dynamic_batch_size:
+                auto_batch = AutoBatchOptimizer(self.train_cfg.max_batch_size, self.train_cfg.min_batch_size, self.train_cfg.auto_batch_max_trials)
+                model_probe = self._build_model(torch_mod, vocab_size).to(device)
+                probe_tensors = [_TORCH.tensor(seq, dtype=_TORCH.long) for seq in sequences[: min(len(sequences), self.train_cfg.max_batch_size)]]
+                tuned = auto_batch.tune(probe_tensors, model_probe, device)
+                self.train_cfg.batch_size_per_gpu = tuned
+                del model_probe
+                torch_mod.cuda.empty_cache() if device == "cuda" else None
+
+            dataset = torch_mod.utils.data.TensorDataset(torch_mod.tensor(sequences, dtype=torch_mod.long))
+            dataloader = torch_mod.utils.data.DataLoader(
+                dataset,
+                batch_size=self.train_cfg.batch_size_per_gpu,
+                shuffle=True,
+                num_workers=self.train_cfg.dataloader_workers,
+                drop_last=True,
+            )
 
         model = self._build_model(torch_mod, vocab_size).to(device)
         optimizer = self._build_optimizer(torch_mod, model)
@@ -3600,7 +3892,8 @@ class NovaTrainerPipeline:
         step = 0
         optimizer.zero_grad(set_to_none=True)
         for batch in dataloader:
-            seq = batch[0].to(device)
+            seq = batch[0] if isinstance(batch, (list, tuple)) else batch
+            seq = seq.to(device)
             with mp.autocast():
                 outputs = model(seq[:, :-1], labels=seq[:, 1:])
                 loss = outputs.loss / self.train_cfg.gradient_accumulation_steps
