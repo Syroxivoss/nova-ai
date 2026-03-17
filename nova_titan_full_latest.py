@@ -2196,6 +2196,9 @@ class NovaTitanOrchestrator:
         self.train_cfg = TrainingConfig()
         self.train_cfg.target_tokens = int(os.getenv("NOVA_TRAIN_TOKENS", "0") or 0)
         self.train_cfg.infinite_streaming = os.getenv("NOVA_INFINITE_TRAINING", "1") == "1"
+        self.train_cfg.resume_from = os.getenv("NOVA_RESUME_FROM", "")
+        self.train_cfg.resume_optimizer = os.getenv("NOVA_RESUME_OPT", "1") == "1"
+        self.train_cfg.resume_scheduler = os.getenv("NOVA_RESUME_SCHED", "1") == "1"
         self.trainer = NovaTrainerPipeline(self.model_cfg, self.train_cfg)
         self.compute = ComputePlan(target_tokens=target_tokens)
 
@@ -3560,6 +3563,10 @@ class TrainingConfig:
     log_every_n_steps: int = 50
     log_gpu_every_n_steps: int = 200
     infinite_streaming: bool = True
+    resume_from: str = ""
+    resume_optimizer: bool = True
+    resume_scheduler: bool = True
+    resume_strict: bool = True
     fsdp_wrap_min_params: int = 1_000_000
     tp_size: int = 1
     pp_size: int = 1
@@ -4003,6 +4010,21 @@ class NovaTrainerPipeline:
         start_time = time.time()
         last_log_time = start_time
         last_log_tokens = 0
+        if self.train_cfg.resume_from:
+            resume_path = Path(self.train_cfg.resume_from)
+            if deepspeed_engine:
+                log.warning("Resume is not supported for deepspeed in this pipeline; skipping.")
+            elif resume_path.exists():
+                step, tokens_seen = self._load_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    resume_path,
+                    torch_mod,
+                )
+                last_log_tokens = tokens_seen
+            else:
+                log.warning("Resume checkpoint not found: %s", resume_path)
         optimizer.zero_grad(set_to_none=True)
         loop_total = max_steps if max_steps is not None else None
         for batch in progress(dataloader, total=loop_total, desc="train"):
@@ -4065,13 +4087,29 @@ class NovaTrainerPipeline:
                     reserved = torch_mod.cuda.memory_reserved() / (1024 ** 2)
                     log.info("gpu_mem_mb alloc=%.0f reserved=%.0f", alloc, reserved)
             if step % self.train_cfg.save_every_n_steps == 0:
-                self._save_checkpoint(model, optimizer, scheduler, checkpoint_dir / f"step_{step:06d}.pt", torch_mod)
+                self._save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    checkpoint_dir / f"step_{step:06d}.pt",
+                    torch_mod,
+                    step=step,
+                    tokens_seen=tokens_seen,
+                )
             if target_tokens and tokens_seen >= target_tokens:
                 log.info("Target tokens reached: %d", tokens_seen)
                 break
             if max_steps is not None and step >= max_steps:
                 break
-        self._save_checkpoint(model, optimizer, scheduler, checkpoint_dir / "final.pt", torch_mod)
+        self._save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            checkpoint_dir / "final.pt",
+            torch_mod,
+            step=step,
+            tokens_seen=tokens_seen,
+        )
         return {
             "steps": step,
             "mean_loss": round(sum(losses) / max(1, len(losses)), 6),
@@ -4079,11 +4117,38 @@ class NovaTrainerPipeline:
         }
 
     @staticmethod
-    def _save_checkpoint(model, optimizer, scheduler, path: Path, torch_mod):
-        payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+    def _save_checkpoint(model, optimizer, scheduler, path: Path, torch_mod, step: int = 0, tokens_seen: int = 0):
+        payload = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": int(step),
+            "tokens_seen": int(tokens_seen),
+        }
         if scheduler is not None:
             payload["scheduler"] = scheduler.state_dict()
         torch_mod.save(payload, path)
+
+    def _load_checkpoint(self, model, optimizer, scheduler, path: Path, torch_mod) -> Tuple[int, int]:
+        payload = torch_mod.load(path, map_location="cpu")
+        strict = self.train_cfg.resume_strict
+        try:
+            model.load_state_dict(payload.get("model", {}), strict=strict)
+        except Exception as exc:
+            log.warning("Model resume failed: %s", exc)
+        if self.train_cfg.resume_optimizer and payload.get("optimizer") is not None:
+            try:
+                optimizer.load_state_dict(payload["optimizer"])
+            except Exception as exc:
+                log.warning("Optimizer resume failed: %s", exc)
+        if self.train_cfg.resume_scheduler and scheduler is not None and payload.get("scheduler") is not None:
+            try:
+                scheduler.load_state_dict(payload["scheduler"])
+            except Exception as exc:
+                log.warning("Scheduler resume failed: %s", exc)
+        step = int(payload.get("step", 0))
+        tokens_seen = int(payload.get("tokens_seen", 0))
+        log.info("Resumed from checkpoint step=%d tokens=%d", step, tokens_seen)
+        return step, tokens_seen
 
 
 # =============================================================================
@@ -5168,6 +5233,9 @@ class NovaTitanOrchestratorV3(NovaTitanOrchestrator):
         self.train_cfg = TrainingConfig()
         self.train_cfg.target_tokens = int(os.getenv("NOVA_TRAIN_TOKENS", "0") or 0)
         self.train_cfg.infinite_streaming = os.getenv("NOVA_INFINITE_TRAINING", "1") == "1"
+        self.train_cfg.resume_from = os.getenv("NOVA_RESUME_FROM", "")
+        self.train_cfg.resume_optimizer = os.getenv("NOVA_RESUME_OPT", "1") == "1"
+        self.train_cfg.resume_scheduler = os.getenv("NOVA_RESUME_SCHED", "1") == "1"
         self.trainer = NovaTrainerPipeline(self.model_cfg, self.train_cfg)
         self.packer = ContextPacker(context_window=self.model_cfg.max_seq_len, overlap=512)
         self.evaluator = Evaluator()
